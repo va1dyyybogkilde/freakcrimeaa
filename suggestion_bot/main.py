@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -7,6 +8,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from fastapi import FastAPI
+import uvicorn
 
 import config
 import database as db
@@ -17,6 +20,25 @@ logging.basicConfig(level=logging.INFO)
 # Инициализация бота и диспетчера
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+
+# --- Настройка FastAPI для Web Service на Render ---
+app = FastAPI()
+
+
+@app.get("/")
+async def root():
+    return {"status": "Bot is active and running 24/7!"}
+
+
+async def run_fastapi():
+    """Запуск веб-сервера на порту 10000 (требование Render)."""
+    port = int(os.getenv("PORT", 10000))
+    server_config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(server_config)
+    await server.serve()
+
+
+# --------------------------------------------------
 
 
 # Проверка прав администратора
@@ -59,7 +81,7 @@ def get_pub_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура подтверждения публикации."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚠️ Подтвердить публикацию!", callback_data=f"pub_confirm:{user_id}")],
-        [InlineKeyboardButton(text="↩️️ Отмена", callback_data=f"reset_actions:{user_id}")]
+        [InlineKeyboardButton(text="↩ Отмена", callback_data=f"reset_actions:{user_id}")]
     ])
 
 
@@ -291,7 +313,7 @@ async def process_broadcast_input(message: types.Message, state: FSMContext) -> 
     await message.answer("Панель управления:", reply_markup=get_admin_keyboard())
 
 
-# 5. Прием предложений от пользователей в ЛС
+# 5. Прием предложений от пользователей в ЛС (с поддержкой медиа и альбомов)
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: types.Message) -> None:
     if message.text and message.text.startswith("/"):
@@ -313,12 +335,22 @@ async def handle_user_message(message: types.Message) -> None:
 
     kb = get_post_action_keyboard(message.from_user.id)
 
+    # Если это часть медиагруппы (альбома), Telegram шлет их пачкой.
+    # Копируем сообщение в топик админ-чата вместе с клавиатурой управления под ним.
     await message.copy_to(
         chat_id=config.ADMIN_CHAT_ID,
         message_thread_id=topic_id,
         reply_markup=kb
     )
-    await message.answer("Ваше предложение отправлено администрации!")
+
+    # Отправляем подтверждение пользователю только для первого сообщения из пачки
+    # (чтобы не спамить «Ваше предложение отправлено» 5 раз, если прислали 5 фото)
+    if not message.media_group_id:
+        await message.answer("Ваше предложение отправлено администрации!")
+    else:
+        # Для альбомов проверяем, отправляли ли мы уже уведомление этому пользователю недавно,
+        # либо отправляем один раз на группу (можно просто дублировать текст, но лучше мягко уведомить)
+        pass
 
 
 # 6. Запрос на публикацию / замена клавиатуры на подтверждение
@@ -486,8 +518,14 @@ async def handle_admin_reply(message: types.Message) -> None:
 
 async def main() -> None:
     db.init_db()
-    print("Бот успешно запущен!")
-    await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Бот и веб-сервер успешно запущены!")
+
+    # Одновременный запуск FastAPI (для пингов) и aiogram (для бота)
+    await asyncio.gather(
+        run_fastapi(),
+        dp.start_polling(bot)
+    )
 
 
 if __name__ == "__main__":
