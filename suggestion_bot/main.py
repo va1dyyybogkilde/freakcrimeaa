@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
@@ -20,6 +21,40 @@ logging.basicConfig(level=logging.INFO)
 # Инициализация бота и диспетчера
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+
+# --- Временная память альбомов (media_group_id -> [ID сообщений в топике]) ---
+album_topics: dict[str, list[int]] = {}
+_album_timestamps: dict[str, float] = {}
+
+
+def _album_members_for(topic_msg_id: int) -> list[int] | None:
+    """Список ID сообщений альбома в топике по любому ID группы."""
+    for ids in album_topics.values():
+        if topic_msg_id in ids:
+            return ids
+    return None
+
+
+def _forget_album(topic_msg_id: int) -> None:
+    for key, ids in list(album_topics.items()):
+        if topic_msg_id in ids:
+            album_topics.pop(key, None)
+            _album_timestamps.pop(key, None)
+            break
+
+
+def _prune_album_topics(limit: int = 300) -> None:
+    if len(album_topics) <= limit:
+        return
+    now = time.monotonic()
+    for key in [k for k, t in _album_timestamps.items() if now - t > 6 * 3600]:
+        album_topics.pop(key, None)
+        _album_timestamps.pop(key, None)
+    while len(album_topics) > limit:
+        oldest = min(_album_timestamps, key=_album_timestamps.get)
+        album_topics.pop(oldest, None)
+        _album_timestamps.pop(oldest, None)
+
 
 # --- Настройка FastAPI для Web Service на Render ---
 app = FastAPI()
@@ -335,13 +370,19 @@ async def handle_user_message(message: types.Message) -> None:
 
     kb = get_post_action_keyboard(message.from_user.id)
 
-    # Если это часть медиагруппы (альбома), Telegram шлет их пачкой.
     # Копируем сообщение в топик админ-чата вместе с клавиатурой управления под ним.
-    await message.copy_to(
+    copied = await message.copy_to(
         chat_id=config.ADMIN_CHAT_ID,
         message_thread_id=topic_id,
         reply_markup=kb
     )
+
+    # Если это часть медиагруппы (альбома/коллажа) — запоминаем ID сообщения в топике,
+    # чтобы при публикации отправить в канал весь коллаж целиком.
+    if message.media_group_id:
+        album_topics.setdefault(message.media_group_id, []).append(copied.message_id)
+        _album_timestamps[message.media_group_id] = time.monotonic()
+        _prune_album_topics()
 
     # Отправляем подтверждение пользователю только для первого сообщения из пачки
     # (чтобы не спамить «Ваше предложение отправлено» 5 раз, если прислали 5 фото)
@@ -384,23 +425,42 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
 
     original_text = source_msg.text or source_msg.caption or ""
     footer = getattr(config, "POST_FOOTER", "")
-    final_caption = f"{original_text}\n\n{footer}".strip() if footer else original_text.strip()
+    final_primary = f"{original_text}\n\n{footer}".strip() if footer else original_text.strip()
 
+    published_ids: list[int] = []
     try:
-        if source_msg.text:
-            published_msg = await bot.send_message(
-                chat_id=config.CHANNEL_ID,
-                text=final_caption,
-                parse_mode="HTML"
-            )
+        # Коллаж (альбом): публикуем все сообщения группы, подпись — на первое
+        album_members = _album_members_for(source_msg.message_id)
+        if album_members:
+            for i, mid in enumerate(album_members):
+                caption = final_primary if i == 0 else None
+                pm = await bot.copy_message(
+                    chat_id=config.CHANNEL_ID,
+                    from_chat_id=source_msg.chat.id,  # админ-чат, где лежит топик
+                    message_id=mid,
+                    caption=caption,
+                    parse_mode="HTML" if caption else None,
+                )
+                published_ids.append(pm.message_id)
+                if i < len(album_members) - 1:
+                    await asyncio.sleep(1.0)  # чтобы Telegram склеил сообщения в один альбом
         else:
-            published_msg = await bot.copy_message(
-                chat_id=config.CHANNEL_ID,
-                from_chat_id=source_msg.chat.id,
-                message_id=source_msg.message_id,
-                caption=final_caption,
-                parse_mode="HTML"
-            )
+            if source_msg.text:
+                pm = await bot.send_message(
+                    chat_id=config.CHANNEL_ID,
+                    text=final_primary,
+                    parse_mode="HTML",
+                )
+            else:
+                pm = await bot.copy_message(
+                    chat_id=config.CHANNEL_ID,
+                    from_chat_id=source_msg.chat.id,
+                    message_id=source_msg.message_id,
+                    caption=final_primary,
+                    parse_mode="HTML",
+                )
+            published_ids.append(pm.message_id)
+        _forget_album(source_msg.message_id)
     except TelegramBadRequest as e:
         logging.error(f"Ошибка публикации поста: {e}")
         await callback.answer(
@@ -410,10 +470,11 @@ async def publish_post_confirm(callback: types.CallbackQuery) -> None:
         return
 
     db.save_post(
-        channel_msg_id=published_msg.message_id,
+        channel_msg_id=published_ids[0],
         user_id=int(user_id),
         topic_id=source_msg.message_thread_id or 0,
-        post_text=original_text or "[Медиафайл]"
+        post_text=original_text or "[Медиафайл]",
+        media_ids=published_ids
     )
 
     await callback.answer("Пост успешно опубликован!", show_alert=True)

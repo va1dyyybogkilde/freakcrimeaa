@@ -41,6 +41,11 @@ def init_db() -> None:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Для уже существующей таблицы (не трогаем данные) — просто добавляем колонку,
+            # если её ещё нет. Никакие строки не изменяются и не удаляются.
+            cur.execute("""
+                ALTER TABLE posts ADD COLUMN IF NOT EXISTS media_ids TEXT;
+            """)
         conn.commit()
 
 
@@ -137,19 +142,40 @@ def get_all_users() -> list[int]:
             return [row[0] for row in rows]
 
 
-def save_post(channel_msg_id: int, user_id: int, topic_id: int, post_text: str) -> None:
-    """Сохранение опубликованного поста."""
+def save_post(
+    channel_msg_id: int,
+    user_id: int,
+    topic_id: int,
+    post_text: str,
+    media_ids: list[int] | None = None,
+) -> None:
+    """Сохранение опубликованного поста (media_ids — ID сообщений коллажа в канале)."""
+    media_ids_str = ",".join(str(x) for x in media_ids) if media_ids else None
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO posts (channel_msg_id, user_id, topic_id, post_text)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO posts (channel_msg_id, user_id, topic_id, post_text, media_ids)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (channel_msg_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     topic_id = EXCLUDED.topic_id,
-                    post_text = EXCLUDED.post_text;
-            """, (channel_msg_id, user_id, topic_id, post_text))
+                    post_text = EXCLUDED.post_text,
+                    media_ids = COALESCE(EXCLUDED.media_ids, posts.media_ids);
+            """, (channel_msg_id, user_id, topic_id, post_text, media_ids_str))
         conn.commit()
+
+
+def delete_post(channel_msg_id: int) -> list[int] | None:
+    """Удаление поста из БД. Возвращает media_ids для удаления коллажа в канале."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT media_ids FROM posts WHERE channel_msg_id = %s;", (channel_msg_id,))
+            row = cur.fetchone()
+            cur.execute("DELETE FROM posts WHERE channel_msg_id = %s;", (channel_msg_id,))
+            conn.commit()
+            if not row or not row[0]:
+                return None
+            return [int(x) for x in row[0].split(",") if x.strip().lstrip("-").isdigit()]
 
 
 def get_user_by_topic(topic_id: int) -> int | None:
