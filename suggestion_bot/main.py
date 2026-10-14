@@ -97,6 +97,15 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def get_find_result_keyboard(channel_msg_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура действий над найденным постом (удаление из канала и т.п.)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить пост из канала", callback_data=f"del_post:{channel_msg_id}")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="❌ Закрыть меню", callback_data="admin_close")]
+    ])
+
+
 def get_cancel_keyboard() -> InlineKeyboardMarkup:
     """Кнопка отмены для режимов ввода."""
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -316,7 +325,7 @@ async def process_find_input(message: types.Message, state: FSMContext) -> None:
         response,
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=get_admin_keyboard()
+        reply_markup=get_find_result_keyboard(channel_msg_id)
     )
 
 
@@ -575,6 +584,47 @@ async def handle_admin_reply(message: types.Message) -> None:
             await message.copy_to(chat_id=user_id)
         except TelegramAPIError:
             await message.reply("Не удалось доставить сообщение (пользователь заблокировал бота).")
+
+
+# 13. Удаление поста из канала (в т.ч. всего коллажа) — из результатов поиска
+@dp.callback_query(F.data.startswith("del_post:"))
+async def delete_post_callback(callback: types.CallbackQuery) -> None:
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав администратора.", show_alert=True)
+        return
+
+    if not callback.data:
+        return
+
+    _, channel_msg_id_str = callback.data.split(":")
+    channel_msg_id = int(channel_msg_id_str)
+
+    # delete_post возвращает media_ids (все ID коллажа в канале), чтобы удалить их все
+    media_ids = db.delete_post(channel_msg_id) or [channel_msg_id]
+
+    deleted_count = 0
+    for mid in media_ids:
+        try:
+            await bot.delete_message(chat_id=config.CHANNEL_ID, message_id=mid)
+            deleted_count += 1
+        except TelegramAPIError:
+            pass
+
+    if isinstance(callback.message, types.Message):
+        if deleted_count:
+            await callback.message.edit_text(
+                "🗑 Пост удалён из канала.",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await callback.message.edit_text(
+                "⚠️ Не удалось удалить пост (возможно, он уже удалён).",
+                reply_markup=get_admin_keyboard()
+            )
+    await callback.answer(
+        f"Удалено сообщений: {deleted_count}" if deleted_count else "Пост не найден в канале.",
+        show_alert=True
+    )
 
 
 async def main() -> None:
